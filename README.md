@@ -2,6 +2,7 @@
 
 **Work on your PHP sites locally, keep them in step with the live server, safely.**
 
+I'm in the business of posting my older ready made stuff here in the hope somebody finds them useful.
 wwwdev runs local copies of your sites, only while you need them: PHP's built-in web server, one
 port per site, and a private MariaDB that only listens on a socket. No root, no Docker, nothing
 system-wide, nothing at boot. Everything lives in one folder you own.
