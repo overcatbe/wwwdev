@@ -1,0 +1,408 @@
+#!/bin/zsh
+# wwwdev - local copies of your PHP sites, only while you need them.
+# Private MariaDB (socket only, no network port) + PHP's built-in server, one port per site.
+# No root, no Docker, nothing system-wide. Sync with the live server over SSH (rsync) or FTP.
+#
+# Copyright (C) 2026 overcatbe. GPL-3.0-or-later (see LICENSE).
+#
+# Settings (environment, all optional):
+#   WWWDEV_HOME        where everything lives (default ~/www): sites.conf, the sites, _db, _dev
+#   WWWDEV_MARIADBD    the MariaDB server program (default: found by itself)
+#   WWWDEV_REMOTE_PHP  the php command on your server for database dumps (default: php)
+
+emulate -L zsh
+setopt err_return no_unset pipe_fail
+autoload -Uz colors && colors
+
+BASE=${WWWDEV_HOME:-$HOME/www}
+CONF=$BASE/sites.conf
+HERE=${0:A:h}                       # where this script is: router.php is next to it
+RUN=$BASE/_db/run
+DATA=$BASE/_db/data
+LOGS=$BASE/_dev/logs
+SOCK=$RUN/mysql.sock
+MARIADBD=${WWWDEV_MARIADBD:-}
+if [[ -z $MARIADBD ]]; then
+    for m in /usr/libexec/mariadbd /usr/sbin/mariadbd /usr/bin/mariadbd /usr/sbin/mysqld /usr/libexec/mysqld; do
+        [[ -x $m ]] && { MARIADBD=$m; break }
+    done
+    unset m
+fi
+REMOTE_PHP=${WWWDEV_REMOTE_PHP:-php}
+
+# What a sync replaces is kept here: old database dumps, and files it overwrote or removed.
+HIST_DB=$BASE/_db/history
+HIST_FILES=$BASE/_history
+
+# Never pushed to the server: local-only or server-owned data.
+PUSH_EXCLUDES=(config/ uploads/ logs/ '*.sql' '*.log')
+# Never pulled: the server's own runtime state (visitors' PHP sessions, only the web server may read them).
+PULL_EXCLUDES=(sessions/)
+
+ok()   { print -P "  %F{green}●%f $*" }
+off()  { print -P "  %F{242}○%f $*" }
+warn() { print -P "  %F{yellow}▲%f $*" }
+die()  { print -P "  %F{red}✖%f $*" >&2; exit 1 }
+head() { print -P "\n%B%F{cyan}▌ $*%f%b" }
+
+# ── Site list ────────────────────────────────────────────────────────────────
+typeset -A PORT DB SRC ROOT
+SITES=()
+if [[ ! -r $CONF ]]; then
+    [[ ${1:-help} == (init|help|-h|--help) ]] || die "no site list at $CONF  (first time? wwwdev init)"
+fi
+[[ -r $CONF ]] && while read -r name port db src root; do
+    [[ -z $name || $name == \#* ]] && continue
+    [[ -n $port && -n $db && -n $src ]] || die "sites.conf: incomplete line for '$name'"
+    SITES+=($name); PORT[$name]=$port; DB[$name]=$db; SRC[$name]=$src; ROOT[$name]=${root:-public}
+done < $CONF
+
+alive()     { [[ -f $1 ]] && kill -0 "$(<$1)" 2>/dev/null }
+db_up()     { [[ -S $SOCK ]] && mariadb-admin --no-defaults -S $SOCK ping &>/dev/null }
+sql()       { mariadb --no-defaults -S $SOCK "$@" }
+has_db()    { [[ ${DB[$1]} != - ]] }
+docroot()   { print -r -- ${BASE}/$1/${ROOT[$1]} }
+need_site() { [[ -n ${1:-} ]] || die "which site? (${(j:, :)SITES})"
+              (( ${SITES[(Ie)$1]} )) || die "unknown site '$1' (known: ${(j:, :)SITES})" }
+confirm()   { print -Pn "  %F{yellow}?%f $1 [y/N] "; read -q || { print; return 1 }; print }
+# Local-only files: <site>/.gitignore (next to the docroot), one pattern per line, # comments.
+# Never listed, deleted or overwritten by sync/pull, never pushed. Sets $reply to rsync excludes.
+local_only() {
+    local f=$BASE/$1/.gitignore l; reply=(--exclude=/.gitignore)
+    [[ -r $f ]] || return 0
+    while IFS= read -r l || [[ -n $l ]]; do
+        [[ -z ${l// } || $l == \#* ]] || reply+=(--exclude=$l)
+    done < $f
+}
+# sites given on the command line, or all of them
+pick()      { if (( $# )); then local s; for s in $@; do need_site $s; done; print -r -- $@; else print -r -- $SITES; fi }
+
+# ── Database ─────────────────────────────────────────────────────────────────
+db_start() {
+    db_up && return
+    (( ${#SOCK} <= 107 )) || die "the database socket's path is too long for the system (${#SOCK} > 107 characters): use a shorter WWWDEV_HOME"
+    [[ -n $MARIADBD ]] || die "no MariaDB server found (set WWWDEV_MARIADBD to it)"
+    mkdir -p $RUN $LOGS
+    $MARIADBD --no-defaults --datadir=$DATA --socket=$SOCK --pid-file=$RUN/mariadbd.pid \
+        --skip-networking --character-set-server=utf8mb4 --log-error=$LOGS/mariadb.log &>/dev/null &!
+    local i; for i in {1..30}; do db_up && break; sleep 0.5; done
+    db_up && ok "MariaDB started %F{242}(socket only)%f" || die "MariaDB did not start, see $LOGS/mariadb.log"
+}
+
+db_stop() {
+    db_up || return 0
+    mariadb-admin --no-defaults -S $SOCK shutdown && ok "MariaDB stopped"
+}
+
+# Stop the database once no running site needs it.
+db_stop_if_idle() {
+    local s; for s in $SITES; do has_db $s && alive $RUN/php-$s.pid && return 0; done
+    db_stop
+}
+
+# Create the local database and user from the site's own config/database.php (DB_* constants),
+# so the config file stays identical to the server's.
+db_ensure() {
+    local s=$1 cfg=$(docroot $1)/config/database.php
+    sql -e "CREATE DATABASE IF NOT EXISTS \`${DB[$s]}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    [[ -r $cfg ]] || { warn "no config/database.php: create the local DB user for '${DB[$s]}' by hand"; return 0 }
+    php -r '
+        $c = file_get_contents($argv[1]); $k = [];
+        foreach (["DB_USER","DB_PASS"] as $n)
+            if (preg_match("/define\(\s*[\x27\"]".$n."[\x27\"]\s*,\s*([\x27\"])(.*?)\\1\s*\)/s", $c, $m)) $k[$n] = stripcslashes($m[2]);
+        if (count($k) < 2) exit(3);
+        $q = fn($v) => "\x27".str_replace(["\\","\x27"], ["\\\\","\\\x27"], $v)."\x27";
+        $u = $q($k["DB_USER"])."@\x27localhost\x27";
+        echo "CREATE USER IF NOT EXISTS $u IDENTIFIED BY ".$q($k["DB_PASS"]).";\n";
+        echo "ALTER USER $u IDENTIFIED BY ".$q($k["DB_PASS"]).";\n";
+        echo "GRANT ALL PRIVILEGES ON `".$argv[2]."`.* TO $u;\nFLUSH PRIVILEGES;\n";
+    ' $cfg ${DB[$s]} | sql || warn "could not read DB_USER/DB_PASS from config/database.php"
+}
+
+# ── Sites ────────────────────────────────────────────────────────────────────
+site_start() {
+    local s=$1 p=${PORT[$1]} pid=$RUN/php-$1.pid dr=$(docroot $1)
+    if alive $pid; then ok "$s already on %Uhttp://localhost:$p%u"; return; fi
+    [[ -d $dr ]] || { warn "$s has no local files yet  %F{242}(wwwdev pull $s)%f"; return 0 }
+    has_db $s && db_start
+    mkdir -p $RUN $LOGS $BASE/_dev/sessions
+    local router=()
+    [[ -f $dr/index.php ]] && router=($HERE/router.php)
+    php -d pdo_mysql.default_socket=$SOCK -d mysqli.default_socket=$SOCK \
+        -d session.save_path=$BASE/_dev/sessions -d display_errors=1 \
+        -d error_log=$LOGS/$s.php.log \
+        -S localhost:$p -t $dr $router &>$LOGS/$s.server.log &!
+    print $! > $pid
+    sleep 0.4
+    alive $pid && ok "$s  →  %B%Uhttp://localhost:$p%u%b" || { rm -f $pid; die "$s failed to start, see $LOGS/$s.server.log" }
+}
+
+site_stop() {
+    local s=$1 pid=$RUN/php-$1.pid
+    if alive $pid; then kill "$(<$pid)" && ok "$s stopped"; else off "$s was not running"; fi
+    rm -f $pid
+}
+
+cmd_start() { head "starting"; local s; for s in $(pick $@); do site_start $s; done; print }
+
+cmd_stop() {
+    head "stopping"
+    local s; for s in $(pick $@); do site_stop $s; done
+    db_stop_if_idle
+    print
+}
+
+cmd_status() {
+    head "status"
+    db_up && ok "MariaDB running" || off "MariaDB stopped"
+    local s
+    for s in $SITES; do
+        if alive $RUN/php-$s.pid; then ok "$s  →  %Uhttp://localhost:${PORT[$s]}%u"
+        elif [[ -d $(docroot $s) ]]; then off "$s"
+        else off "$s  %F{242}(not pulled yet)%f"; fi
+    done
+    print
+}
+
+cmd_list() {
+    head "sites  %F{242}($CONF)%f"
+    local s
+    for s in $SITES; do
+        printf "  %-24s :%-5s db %-14s %s\n" $s ${PORT[$s]} ${DB[$s]} ${SRC[$s]}
+    done
+    print
+}
+
+cmd_logs() {
+    need_site ${1:-}
+    tail -n 40 -f $LOGS/$1.server.log $LOGS/$1.php.log 2>/dev/null
+}
+
+# ── Pull: remote → local. Overwrites local changes. ──────────────────────────
+pull_files() {
+    local s=$1 src=${SRC[$1]}
+    mkdir -p $BASE/$s
+    case $src in
+        -)       die "$s has no remote source in sites.conf; copy its files to $BASE/$s by hand" ;;
+        ftp://*) local host=${${src#ftp://}%%/*} rpath=/${${src#ftp://}#*/}
+                 grep -qs "machine[[:space:]]\+$host" ~/.netrc || die "no FTP login for $host in ~/.netrc  (line: machine $host login USER password PASS; chmod 600)"
+                 lftp -e "set ftp:ssl-allow yes; mirror --delete --parallel=4 --verbose=0 $rpath $BASE/$s; quit" ftp://$host || die "FTP mirror from $host failed" ;;
+        *)       local out; local_only $s
+                 out=$(rsync -a --delete --stats ${PULL_EXCLUDES/#/--exclude=} $reply $src/ $BASE/$s/) || die "rsync from $src failed"
+                 print -r -- "$out" | grep -E "regular files transferred|deleting|deleted files" | sed 's/^/    /' || true ;;
+    esac
+    ok "files synced"
+}
+
+pull_db() {
+    local s=$1 db=${DB[$1]} src=${SRC[$1]} dump=$BASE/_db/$1.sql.gz
+    [[ $src == *:/* && $src != ftp://* ]] || { warn "database of $s is not pulled automatically: put a dump at $dump and run  wwwdev loaddb $s"; return 0 }
+    local host=${src%%:*} rcfg=${src#*:}/${ROOT[$s]}/config/database.php
+    # The server-side config hands its own credentials to the dump tool; nothing is shown here.
+    ssh $host "$REMOTE_PHP -r 'require \"$rcfg\"; putenv(\"MYSQL_PWD=\".DB_PASS); passthru(\"mariadb-dump --single-transaction --no-tablespaces --routines -h \".DB_HOST.\" -u \".DB_USER.\" \".DB_NAME, \$rc); exit(\$rc);'" \
+        | gzip > $dump.new
+    zcat $dump.new | tail -n 1 | grep -q "Dump completed" || { rm -f $dump.new; die "dump incomplete, local database left untouched" }
+    # The dump that is replaced is kept, named by its date. Nothing there is removed by itself.
+    if [[ -f $dump ]]; then
+        mkdir -p $HIST_DB; chmod 700 $HIST_DB
+        mv $dump $HIST_DB/$s.$(date -r $dump +%Y%m%d-%H%M%S).sql.gz
+    fi
+    mv $dump.new $dump; chmod 600 $dump
+    load_db $s
+}
+
+load_db() {
+    local s=$1 db=${DB[$1]} dump=$BASE/_db/$1.sql.gz
+    [[ -r $dump ]] || die "no dump at $dump"
+    db_start
+    sql -e "DROP DATABASE IF EXISTS \`$db\`;"
+    db_ensure $s
+    zcat $dump | sql $db
+    ok "database '$db' loaded  %F{242}($(sql -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$db'") tables)%f"
+}
+
+cmd_pull() {
+    need_site ${1:-}; local s=$1
+    head "pull $s  (remote → local)"
+    warn "this overwrites the local files${${DB[$s]:#-}:+ and the local database '${DB[$s]}'} with the remote state"
+    confirm "continue?" || { off "cancelled"; return 0 }
+    pull_files $s
+    has_db $s && pull_db $s
+    db_stop_if_idle
+    print
+}
+
+cmd_loaddb() {
+    need_site ${1:-}; has_db $1 || die "$1 has no database in sites.conf"
+    head "loaddb $1"
+    confirm "replace the local database '${DB[$1]}' with $BASE/_db/$1.sql.gz?" || { off "cancelled"; return 0 }
+    load_db $1; db_stop_if_idle; print
+}
+
+# ── Sync: content from the server, without losing code that is only here. ────
+# The server owns the content (database, uploads), this laptop owns the code. Sync looks
+# for code that differs first, then fetches everything else from the server.
+
+# Code files that differ from the server's, one path per line relative to the web root.
+# With "newer": only those that are newer here, or only here (work that was not pushed).
+code_diff() {
+    local s=$1 ex=() e out opt=-rlptnc
+    [[ ${2:-} == newer ]] && opt=-rlptncu
+    for e in $PUSH_EXCLUDES; do ex+=(--exclude=$e); done
+    local_only $s; ex+=($reply)
+    out=$(rsync $opt --itemize-changes --omit-dir-times $ex $(docroot $s)/ ${SRC[$s]}/${ROOT[$s]}/) \
+        || die "could not compare with ${SRC[$s]}"
+    print -r -- "$out" | grep '^<f' | cut -c13- || true
+}
+
+# Mirror the site's files from the server. Arguments after the site: code files to leave alone.
+# What the mirror replaces or removes here is kept under _history/<site>/<time>/, for good.
+sync_files() {
+    local s=$1 src=${SRC[$1]}; shift
+    local pre=${ROOT[$s]}/ ex=() f out
+    [[ $pre == ./ ]] && pre=
+    for f in $@; do ex+=(--exclude=/$pre$f); done
+    local_only $s; ex+=($reply)
+    local hist=$HIST_FILES/$s/$(date +%Y%m%d-%H%M%S)
+    mkdir -p $BASE/$s
+    # Server logs change all the time: fetched, but not worth keeping old copies of.
+    out=$(rsync -a --delete --stats --backup --backup-dir=$hist --exclude=/${pre}logs/ $ex $src/ $BASE/$s/) \
+        || die "rsync from $src failed"
+    print -r -- "$out" | grep -E "regular files transferred|deleted files" | sed 's/^/    /' || true
+    rsync -a --delete $src/${pre}logs/ $BASE/$s/${pre}logs/ 2>/dev/null || true
+    [[ -d $hist ]] && off "replaced or removed here, old copies in ${hist/#$HOME/~}"
+    ok "files in step with the server"
+}
+
+cmd_sync() {
+    need_site ${1:-}; local s=$1 src=${SRC[$1]}
+    [[ $src == *:/* && $src != ftp://* ]] || die "sync only works for SSH sites; use  wwwdev pull $s"
+    head "sync $s  (content: server → here)"
+    local differ mine theirs keep=() a
+    differ=$(code_diff $s); mine=$(code_diff $s newer)
+    theirs=$(comm -23 <(print -r -- "$differ" | sort) <(print -r -- "$mine" | sort))
+    if [[ -n $theirs ]]; then
+        off "code that differs and is not newer here — the server's version will be fetched:"
+        print -r -- "$theirs" | sed 's/^/    /'
+    fi
+    if [[ -n $mine ]]; then
+        warn "code on this laptop that the server doesn't have yet:"
+        print -r -- "$mine" | sed 's/^/    /'
+        print -P "  %F{yellow}?%f %Bp%b = push it to the LIVE site first   %Bk%b = keep it here, sync the rest   %Bd%b = discard it   %Bc%b = cancel"
+        print -n "    "; read -k 1 a || a=c; print
+        case $a in
+            p) cmd_push $s
+               [[ -z $(code_diff $s newer) ]] || { off "not pushed, sync cancelled"; return 0 } ;;
+            k) keep=(${(f)mine}) ;;
+            d) confirm "really replace these files with the server's version?" || { off "cancelled"; return 0 } ;;
+            *) off "cancelled"; return 0 ;;
+        esac
+    elif [[ -n $theirs ]]; then
+        confirm "continue?" || { off "cancelled"; return 0 }
+    else
+        ok "code is the same here and on the server"
+    fi
+    sync_files $s $keep
+    has_db $s && pull_db $s
+    db_stop_if_idle
+    (( $#keep )) && warn "$#keep code file(s) kept as they are here — push them when they are ready"
+    ok "$s is in step with the server  %F{242}(older database dumps: ${HIST_DB/#$HOME/~})%f"
+    print
+}
+
+# ── Push: local → server, code only. Shows what would change, then asks. ─────
+cmd_push() {
+    need_site ${1:-}; local s=$1 src=${SRC[$1]} ex=() e
+    [[ $src == *:/* && $src != ftp://* ]] || die "push only works for SSH sites; upload $s by hand"
+    for e in $PUSH_EXCLUDES; do ex+=(--exclude=$e); done
+    local_only $s; ex+=($reply)
+    local from=$(docroot $s)/ to=$src/${ROOT[$s]}/
+    head "push $s  (local → server)"
+    off "never pushed: ${(j:, :)PUSH_EXCLUDES}"
+    (( $#reply > 1 )) && off "local only (.gitignore): ${(j:, :)${${reply[2,-1]}#--exclude=}}"
+    local changes
+    changes=$(rsync -rlptn --itemize-changes --omit-dir-times $ex $from $to | grep -v '^\.d' || true)
+    if [[ -z $changes ]]; then ok "nothing to push, server is up to date"; print; return 0; fi
+    print -P "  %F{242}files that would be uploaded:%f"
+    print -r -- "$changes" | sed 's/^/    /'
+    confirm "upload these $(print -r -- "$changes" | wc -l) file(s) to the LIVE site?" || { off "cancelled"; return 0 }
+    rsync -rlpt --omit-dir-times $ex $from $to
+    ok "pushed to $s"
+    print
+}
+
+# ── Init: the folder, a site list to fill in, the private database ───────────
+cmd_init() {
+    head "init  ${BASE/#$HOME/~}"
+    mkdir -p $BASE/_dev/sessions $LOGS $RUN
+    if [[ -r $CONF ]]; then
+        off "site list already there: ${CONF/#$HOME/~}"
+    else
+        cat > $CONF <<'EOF'
+# wwwdev site list - one site per line, columns separated by spaces:
+#
+#   name      local folder under this one (use the domain)
+#   port      local port: http://localhost:<port>
+#   database  local database name, or - if the site has none
+#   source    where pull and sync fetch from:
+#               host:/path          over SSH (rsync), host as in ~/.ssh/config
+#               ftp://host/path     over FTP (lftp), login taken from ~/.netrc
+#               -                   no remote, files are copied by hand
+#   docroot   web root inside the site folder (public, or . for the folder itself)
+#
+# name                port  database   source                          docroot
+#example.com          8001  example    myserver:/var/www/example.com    public
+#notes.example.com    8002  -          myserver:/var/www/notes          .
+EOF
+        ok "site list: ${CONF/#$HOME/~}  %F{242}(one line per site)%f"
+    fi
+    if [[ -z $MARIADBD ]]; then
+        warn "no MariaDB server found: sites without a database work; install MariaDB for the others"
+    elif [[ -d $DATA/mysql ]]; then
+        off "private database already set up"
+    else
+        mkdir -p $DATA
+        mariadb-install-db --no-defaults --datadir=$DATA --skip-test-db --auth-root-authentication-method=socket \
+            &>$LOGS/install.log || die "setting up the database failed, see $LOGS/install.log"
+        ok "private MariaDB set up  %F{242}(socket only, in ${DATA/#$HOME/~})%f"
+    fi
+    print -P "
+  next: add your sites to ${CONF/#$HOME/~}, then  %Bwwwdev pull <site>%b  and  %Bwwwdev start <site>%b
+"
+}
+
+cmd_help() {
+    print -P "
+%B%F{cyan}wwwdev%f%b — run local copies of your sites, only while you need them
+
+  %Binit%b             first time: the folder (${BASE/#$HOME/~}), a site list, the private database
+  %Bstart%b  [site…]   start the given sites, or all; the database starts only if needed
+  %Bstop%b   [site…]   stop the given sites, or everything
+  %Bstatus%b           show what is running
+  %Blist%b             show the configured sites
+  %Blogs%b   <site>    follow a site's server and PHP error log
+  %Bsync%b   <site>    content (database, uploads) from the server; code that is only here is
+                   listed first and you choose: push it, keep it, or discard it
+  %Bpull%b   <site>    remote → local: files, uploads and database %F{yellow}(overwrites local)%f
+  %Bloaddb%b <site>    load _db/<site>.sql.gz into the local database
+  %Bpush%b   <site>    local → server: code only, previews changes and asks first
+
+  sites: ${(j:, :)SITES:-none yet}
+  add a site: one line in ${CONF/#$HOME/~}, then  wwwdev pull <site>
+"
+}
+
+case ${1:-help} in
+    init)    cmd_init ;;
+    start)   cmd_start ${@:2} ;;
+    stop)    cmd_stop ${@:2} ;;
+    restart) cmd_stop ${@:2}; cmd_start ${@:2} ;;
+    status)  cmd_status ;;
+    list)    cmd_list ;;
+    logs)    cmd_logs ${2:-} ;;
+    sync)    cmd_sync ${2:-} ;;
+    pull)    cmd_pull ${2:-} ;;
+    loaddb)  cmd_loaddb ${2:-} ;;
+    push)    cmd_push ${2:-} ;;
+    *)       cmd_help ;;
+esac
